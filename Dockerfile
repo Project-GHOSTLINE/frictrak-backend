@@ -3,11 +3,11 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install dependencies
-COPY backend-railway/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
-COPY backend-railway/ .
+COPY . .
 
 # Expose port (Railway provides PORT dynamically)
 EXPOSE ${PORT:-8080}

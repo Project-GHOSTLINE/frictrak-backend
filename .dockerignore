@@ -1,0 +1,12 @@
+.git
+.gitignore
+*.md
+*.bat
+*.sh
+__pycache__
+*.pyc
+.env
+.env.*
+dossiers-clients
+pedro-logs
+rapports-cache
