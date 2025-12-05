@@ -100,6 +100,7 @@ def analyze():
 def analyze_direct():
     """
     Analyse directe sans fichier - traite les données en mémoire
+    Format Inverite: details (pas description), debit/credit (pas amount)
     """
     try:
         data = request.get_json()
@@ -119,26 +120,46 @@ def analyze_direct():
         all_transactions = []
         preteurs_detectes = {}
         nsf_count = 0
+        nsf_details = []
         total_revenus = 0
         total_depenses = 0
+        debt_total = 0
 
         for account in accounts:
             transactions = account.get('transactions', [])
 
             for tx in transactions:
-                description = tx.get('description', '').upper()
-                amount = float(tx.get('amount', 0))
-                tx_type = tx.get('type', '')
+                # INVERITE utilise 'details' pas 'description'
+                description = (tx.get('details') or tx.get('description') or '').upper()
 
-                # Compter les NSF
-                if 'NSF' in description or 'INSUFFICIENT' in description or 'FONDS INSUFF' in description:
+                # INVERITE utilise 'debit'/'credit' pas 'amount'
+                debit = float(tx.get('debit') or 0)
+                credit = float(tx.get('credit') or 0)
+                amount = credit - debit  # Positif = entrée, Négatif = sortie
+
+                tx_date = tx.get('date', '')
+
+                # Compter les NSF (chercher dans description ET flags)
+                flags = tx.get('flags', [])
+                is_nsf = ('NSF' in description or
+                          'INSUFFICIENT' in description or
+                          'FONDS INSUFF' in description or
+                          'OVERDRAFT' in description or
+                          any('nsf' in str(f).lower() for f in flags))
+
+                if is_nsf:
                     nsf_count += 1
+                    nsf_details.append({
+                        'date': tx_date,
+                        'montant': debit or credit,
+                        'description': description
+                    })
 
-                # Catégoriser
-                if tx_type == 'credit' or amount > 0:
-                    total_revenus += abs(amount)
-                else:
-                    total_depenses += abs(amount)
+                # Catégoriser revenus/dépenses
+                if credit > 0:
+                    total_revenus += credit
+                if debit > 0:
+                    total_depenses += debit
 
                 # Détecter les prêteurs
                 if est_preteur(description):
@@ -153,11 +174,41 @@ def analyze_direct():
                                 'total': 0
                             }
                         preteurs_detectes[preteur_nom]['transactions'].append({
-                            'date': tx.get('date', ''),
-                            'amount': amount,
+                            'date': tx_date,
+                            'amount': debit or credit,
                             'description': description
                         })
-                        preteurs_detectes[preteur_nom]['total'] += abs(amount)
+                        preteurs_detectes[preteur_nom]['total'] += (debit or credit)
+                        debt_total += (debit or credit)
+
+        # Extraire revenus depuis payschedules si disponibles
+        revenu_from_payschedules = 0
+        payschedules = data.get('payschedules', [])
+
+        # Chercher aussi dans accounts[0].payschedules
+        if not payschedules and accounts:
+            payschedules = accounts[0].get('payschedules', [])
+
+        # Chercher dans stats
+        stats = data.get('stats', {})
+        employer_income = float(stats.get('employer', {}).get('last_amount', 0) or 0)
+        govt_income = float(stats.get('government', {}).get('last_amount', 0) or 0)
+
+        if employer_income > 0 or govt_income > 0:
+            revenu_from_payschedules = employer_income + govt_income
+            print(f"📊 Revenus stats: employer={employer_income}, govt={govt_income}")
+        elif payschedules:
+            for ps in payschedules:
+                amount = float(ps.get('amount', 0) or ps.get('last_amount', 0) or 0)
+                revenu_from_payschedules += amount
+            print(f"📊 Revenus payschedules: {revenu_from_payschedules}")
+
+        # Calculer revenu mensuel
+        # Priorité: payschedules > calcul depuis transactions (sur 3 mois)
+        if revenu_from_payschedules > 0:
+            revenu_mensuel = revenu_from_payschedules
+        else:
+            revenu_mensuel = round(total_revenus / 3, 2)
 
         # Calculer le score de risque
         score = 100
@@ -170,7 +221,8 @@ def analyze_direct():
             alertes.append({
                 "type": "preteurs",
                 "niveau": "critical" if nb_preteurs >= 3 else "warning",
-                "message": f"{nb_preteurs} prêteur(s) alternatif(s) détecté(s)"
+                "message": f"{nb_preteurs} prêteur(s) alternatif(s) détecté(s)",
+                "details": list(preteurs_detectes.keys())
             })
 
         # Pénalités NSF
@@ -179,7 +231,8 @@ def analyze_direct():
             alertes.append({
                 "type": "nsf",
                 "niveau": "critical" if nsf_count >= 3 else "warning",
-                "message": f"{nsf_count} transaction(s) NSF détectée(s)"
+                "message": f"{nsf_count} transaction(s) NSF détectée(s)",
+                "details": nsf_details
             })
 
         # Score minimum
@@ -203,13 +256,15 @@ def analyze_direct():
             "resume": {
                 "score_risque": str(score),
                 "decision": decision,
-                "revenu_mensuel": round(total_revenus / 3, 2),  # Approximation 3 mois
+                "revenu_mensuel": round(revenu_mensuel, 2),
                 "depenses_mensuelles": round(total_depenses / 3, 2),
                 "nsf_count": nsf_count,
-                "preteurs_count": nb_preteurs
+                "preteurs_count": nb_preteurs,
+                "debt_detected": round(debt_total, 2)
             },
             "preteurs": list(preteurs_detectes.values()),
             "alertes": alertes,
+            "nsf_details": nsf_details,
             "timestamp": datetime.now().isoformat()
         }
 
@@ -400,6 +455,7 @@ REPORTS_CACHE = {}
 def analyze_inverite():
     """
     Analyser des données Inverite et retourner un rapport
+    Format Inverite: details (pas description), debit/credit (pas amount)
     """
     try:
         data = request.get_json()
@@ -415,26 +471,45 @@ def analyze_inverite():
         total_transactions = 0
         preteurs_detectes = {}
         nsf_count = 0
+        nsf_details = []
         total_revenus = 0
         total_depenses = 0
+        debt_total = 0
 
         for account in accounts:
             transactions = account.get('transactions', [])
             total_transactions += len(transactions)
 
             for tx in transactions:
-                description = tx.get('description', '').upper()
-                amount = float(tx.get('amount', 0))
+                # INVERITE utilise 'details' pas 'description'
+                description = (tx.get('details') or tx.get('description') or '').upper()
 
-                # NSF
-                if 'NSF' in description or 'INSUFFICIENT' in description:
+                # INVERITE utilise 'debit'/'credit' pas 'amount'
+                debit = float(tx.get('debit') or 0)
+                credit = float(tx.get('credit') or 0)
+                tx_date = tx.get('date', '')
+
+                # NSF (chercher dans description ET flags)
+                flags = tx.get('flags', [])
+                is_nsf = ('NSF' in description or
+                          'INSUFFICIENT' in description or
+                          'FONDS INSUFF' in description or
+                          'OVERDRAFT' in description or
+                          any('nsf' in str(f).lower() for f in flags))
+
+                if is_nsf:
                     nsf_count += 1
+                    nsf_details.append({
+                        'date': tx_date,
+                        'montant': debit or credit,
+                        'description': description
+                    })
 
                 # Revenus/Dépenses
-                if amount > 0:
-                    total_revenus += amount
-                else:
-                    total_depenses += abs(amount)
+                if credit > 0:
+                    total_revenus += credit
+                if debit > 0:
+                    total_depenses += debit
 
                 # Prêteurs
                 if est_preteur(description):
@@ -444,7 +519,32 @@ def analyze_inverite():
                         if nom not in preteurs_detectes:
                             preteurs_detectes[nom] = {'nom': nom, 'count': 0, 'total': 0}
                         preteurs_detectes[nom]['count'] += 1
-                        preteurs_detectes[nom]['total'] += abs(amount)
+                        preteurs_detectes[nom]['total'] += (debit or credit)
+                        debt_total += (debit or credit)
+
+        # Extraire revenus depuis payschedules/stats
+        revenu_from_payschedules = 0
+        payschedules = data.get('payschedules', [])
+
+        if not payschedules and accounts:
+            payschedules = accounts[0].get('payschedules', [])
+
+        stats = data.get('stats', {})
+        employer_income = float(stats.get('employer', {}).get('last_amount', 0) or 0)
+        govt_income = float(stats.get('government', {}).get('last_amount', 0) or 0)
+
+        if employer_income > 0 or govt_income > 0:
+            revenu_from_payschedules = employer_income + govt_income
+        elif payschedules:
+            for ps in payschedules:
+                amount = float(ps.get('amount', 0) or ps.get('last_amount', 0) or 0)
+                revenu_from_payschedules += amount
+
+        # Revenu mensuel
+        if revenu_from_payschedules > 0:
+            revenu_mensuel = revenu_from_payschedules
+        else:
+            revenu_mensuel = round(total_revenus / 3, 2)
 
         # Score
         score = 100
@@ -467,10 +567,13 @@ def analyze_inverite():
                 "transactions_analysees": total_transactions,
                 "preteurs_count": len(preteurs_detectes),
                 "nsf_count": nsf_count,
+                "revenu_mensuel": round(revenu_mensuel, 2),
                 "revenus": round(total_revenus, 2),
-                "depenses": round(total_depenses, 2)
+                "depenses": round(total_depenses, 2),
+                "debt_detected": round(debt_total, 2)
             },
             "preteurs_detectes": list(preteurs_detectes.values()),
+            "nsf_details": nsf_details,
             "alertes": [],
             "timestamp": datetime.now().isoformat()
         }
@@ -480,13 +583,15 @@ def analyze_inverite():
             report_data["alertes"].append({
                 "type": "preteurs",
                 "niveau": "critical" if len(preteurs_detectes) >= 3 else "warning",
-                "message": f"{len(preteurs_detectes)} prêteur(s) alternatif(s) détecté(s)"
+                "message": f"{len(preteurs_detectes)} prêteur(s) alternatif(s) détecté(s)",
+                "details": list(preteurs_detectes.keys())
             })
         if nsf_count > 0:
             report_data["alertes"].append({
                 "type": "nsf",
                 "niveau": "critical" if nsf_count >= 3 else "warning",
-                "message": f"{nsf_count} transaction(s) NSF détectée(s)"
+                "message": f"{nsf_count} transaction(s) NSF détectée(s)",
+                "details": nsf_details
             })
 
         # Sauvegarder dans le cache
