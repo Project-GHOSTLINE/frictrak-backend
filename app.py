@@ -650,6 +650,108 @@ def get_report(report_id):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route('/api/save-report', methods=['POST'])
+def save_report():
+    """
+    Sauvegarder un rapport complet (depuis Vercel/extension)
+    POST /api/save-report
+    Body: { id: string, data: object }
+    """
+    try:
+        body = request.get_json()
+        report_id = body.get('id')
+        report_data = body.get('data', body)  # Si pas de 'data', utiliser tout le body
+
+        if not report_id:
+            return jsonify({"success": False, "error": "ID manquant"}), 400
+
+        # Sauvegarder en cache mémoire
+        REPORTS_CACHE[report_id] = report_data
+
+        # Sauvegarder en fichier (persistant)
+        reports_dir = os.path.join(os.path.dirname(__file__), 'rapports-cache')
+        if not os.path.exists(reports_dir):
+            os.makedirs(reports_dir, exist_ok=True)
+
+        report_file = os.path.join(reports_dir, f"{report_id}.json")
+        with open(report_file, 'w', encoding='utf-8') as f:
+            json.dump(report_data, f, ensure_ascii=False, indent=2)
+
+        print(f"💾 Rapport sauvegardé: {report_id}")
+
+        return jsonify({
+            "success": True,
+            "id": report_id,
+            "message": "Rapport sauvegardé"
+        })
+
+    except Exception as e:
+        print(f"❌ Erreur save-report: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/reports', methods=['GET'])
+def list_reports():
+    """
+    Lister tous les rapports sauvegardés
+    GET /api/reports
+    Returns: { success: true, reports: [...] }
+    """
+    try:
+        reports = []
+
+        # Lire tous les fichiers du dossier rapports-cache
+        reports_dir = os.path.join(os.path.dirname(__file__), 'rapports-cache')
+        if os.path.exists(reports_dir):
+            for filename in os.listdir(reports_dir):
+                if filename.endswith('.json'):
+                    report_id = filename.replace('.json', '')
+                    report_file = os.path.join(reports_dir, filename)
+
+                    try:
+                        with open(report_file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+
+                        # Extraire les infos essentielles
+                        client_nom = data.get('client', {}).get('nom', 'Inconnu')
+                        if not client_nom or client_nom == 'Inconnu':
+                            client_nom = data.get('nom', 'Inconnu')
+
+                        created_at = data.get('created_at', '')
+                        if not created_at:
+                            # Utiliser la date de modification du fichier
+                            mtime = os.path.getmtime(report_file)
+                            created_at = datetime.fromtimestamp(mtime).isoformat()
+
+                        reports.append({
+                            "id": report_id,
+                            "client_nom": client_nom,
+                            "created_at": created_at,
+                            "data": data
+                        })
+
+                        # Aussi mettre en cache
+                        REPORTS_CACHE[report_id] = data
+
+                    except Exception as e:
+                        print(f"⚠️ Erreur lecture {filename}: {e}")
+
+        # Trier par date (plus récent en premier)
+        reports.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+
+        print(f"📋 {len(reports)} rapports listés")
+
+        return jsonify({
+            "success": True,
+            "reports": reports,
+            "count": len(reports)
+        })
+
+    except Exception as e:
+        print(f"❌ Erreur list-reports: {e}")
+        return jsonify({"success": False, "error": str(e), "reports": []}), 500
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_ENV') == 'development'
