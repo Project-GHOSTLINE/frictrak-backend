@@ -36,7 +36,7 @@ def index():
     return jsonify({
         "status": "ok",
         "service": "FRICTRAK API",
-        "version": "1.0.0",
+        "version": "2.0.0-reports",
         "timestamp": datetime.now().isoformat()
     })
 
